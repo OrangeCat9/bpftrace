@@ -7,6 +7,7 @@
 #include "driver.h"
 #include "utils.h"
 #include "parser.tab.hh"
+#include "ast/int_parser.h"
 
 bpftrace::location loc;
 static std::string struct_type;
@@ -18,21 +19,29 @@ static std::string buffer;
 using namespace bpftrace;
 %}
 
-ident   [_a-zA-Z][_a-zA-Z0-9]*
-map     @{ident}|@
-var     ${ident}
-int     [0-9]+|0[xX][0-9a-fA-F]+
-hex     (x|X)[0-9a-fA-F]{1,2}
-oct     [0-7]{1,3}
-hspace  [ \t]
-vspace  [\n\r]
-space   {hspace}|{vspace}
-path    :(\\.|[_\-\./a-zA-Z0-9#\*])*:
-builtin arg[0-9]|args|cgroup|comm|cpid|cpu|ctx|curtask|elapsed|func|gid|nsecs|pid|probe|rand|retval|sarg[0-9]|tid|uid|username
-call    avg|buf|cat|cgroupid|clear|count|delete|exit|hist|join|kaddr|ksym|lhist|max|min|ntop|override|print|printf|reg|signal|sizeof|stats|str|strncmp|sum|system|time|uaddr|usym|zero
+/* Number with underscores in it, e.g. 1_000_000 */
+int      [0-9]([0-9_]*[0-9])?
+hex      0[xX][0-9a-fA-F]+
+/* scientific notation, e.g. 2e4 or 1e6 */
+exponent {int}[eE]{int}
+
+ident    [_a-zA-Z][_a-zA-Z0-9]*
+map      @{ident}|@
+var      ${ident}
+hspace   [ \t]
+vspace   [\n\r]
+space    {hspace}|{vspace}
+path     :(\\.|[_\-\./a-zA-Z0-9#\*])+
+builtin  arg[0-9]|args|cgroup|comm|cpid|cpu|ctx|curtask|elapsed|func|gid|nsecs|pid|probe|rand|retval|sarg[0-9]|tid|uid|username
+call     avg|buf|cat|cgroupid|clear|count|delete|exit|hist|join|kaddr|kptr|ksym|lhist|macaddr|max|min|ntop|override|print|printf|reg|signal|sizeof|stats|str|strftime|strncmp|sum|system|time|uaddr|uptr|usym|zero|path|unwatch
 
 /* Don't add to this! Use builtin OR call not both */
 call_and_builtin kstack|ustack
+
+/* escape sequences in strings */
+hex_esc  (x|X)[0-9a-fA-F]{1,2}
+oct_esc  [0-7]{1,3}
+
 %x STR
 %x STRUCT
 %x ENUM
@@ -58,7 +67,17 @@ bpftrace|perf           { return Parser::make_STACK_MODE(yytext, loc); }
 {builtin}               { return Parser::make_BUILTIN(yytext, loc); }
 {call}                  { return Parser::make_CALL(yytext, loc); }
 {call_and_builtin}      { return Parser::make_CALL_BUILTIN(yytext, loc); }
-{int}                   { return Parser::make_INT(strtoll(yytext, NULL, 0), loc); }
+{int}|{hex}|{exponent}  {
+                          try
+                          {
+                            auto res = ast::int_parser::to_uint(yytext, 0);
+                            return Parser::make_INT(res, loc);
+                          }
+                          catch (const std::exception &e)
+                          {
+                            driver.error(loc, e.what());
+                          }
+                        }
 {path}                  { return Parser::make_PATH(yytext, loc); }
 {map}                   { return Parser::make_MAP(yytext, loc); }
 {var}                   { return Parser::make_VAR(yytext, loc); }
@@ -129,14 +148,14 @@ bpftrace|perf           { return Parser::make_STACK_MODE(yytext, loc); }
   \\r                   buffer += '\r';
   \\\"                  buffer += '\"';
   \\\\                  buffer += '\\';
-  \\{oct}               {
+  \\{oct_esc}           {
                             long value = strtol(yytext+1, NULL, 8);
                             if (value > UCHAR_MAX)
                               driver.error(loc, std::string("octal escape sequence out of range '") +
                                                 yytext + "'");
                             buffer += value;
                         }
-  \\{hex}               buffer += strtol(yytext+2, NULL, 16);
+  \\{hex_esc}           buffer += strtol(yytext+2, NULL, 16);
   \n                    driver.error(loc, "unterminated string"); yy_pop_state(yyscanner); loc.lines(1); loc.step();
   <<EOF>>               driver.error(loc, "unterminated string"); yy_pop_state(yyscanner);
   \\.                   { driver.error(loc, std::string("invalid escape character '") +
@@ -177,6 +196,7 @@ struct|union|enum       yy_push_state(STRUCT, yyscanner); buffer.clear(); struct
 }
 
 {ident}                 {
+                          static int unput_count = 0;
                           if (driver.bpftrace_.macros_.count(yytext) != 0)
                           {
                             const char *s = driver.bpftrace_.macros_[yytext].c_str();
@@ -188,14 +208,27 @@ struct|union|enum       yy_push_state(STRUCT, yyscanner); buffer.clear(); struct
                             // future.
                             if (strcmp(s, yytext) == 0)
                             {
+                              unput_count = 0;
                               return Parser::make_IDENT(yytext, loc);
                             }
                             else
                             {
-                              for (z=strlen(s) - 1; z >= 0; z--)
+                              int leng = yyleng;
+                              std::string original_s(s);
+                              std::string original_yytext(yytext);
+                              for (z=strlen(s) - 1; z >= 0; z--){
+                                if (unput_count >= 1000 || leng <= 0) {
+                                  driver.error(loc, std::string("Macro recursion limit reached: ")
+                                                    + original_yytext + ", " + original_s);
+                                  yyterminate();
+                                }
                                 unput(s[z]);
+                                unput_count++;
+                                leng--;
+                              }
                             }
                           } else {
+                            unput_count = 0;
                             return Parser::make_IDENT(yytext, loc);
                           }
                         }

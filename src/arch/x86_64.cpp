@@ -32,12 +32,6 @@ static std::array<std::string, 27> registers = {
   "flags",
   "sp",
   "ss",
-  "fs_base",
-  "gs_base",
-  "ds",
-  "es",
-  "fs",
-  "gs",
 };
 
 static std::array<std::string, 6> arg_registers = {
@@ -91,6 +85,17 @@ int arg_stack_offset()
 std::string name()
 {
   return std::string("x86_64");
+}
+
+std::vector<std::string> invalid_watchpoint_modes()
+{
+  // See intel developer manual, Volume 3, section 17.2.4
+  return std::vector<std::string>{
+    "r",
+    "rx",
+    "wx",
+    "rwx",
+  };
 }
 
 } // namespace arch

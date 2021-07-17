@@ -5,8 +5,10 @@
 #  LIBBCC_INCLUDE_DIRS - the libbcc include directory
 #  LIBBCC_LIBRARIES - Link these to use libbcc
 #  LIBBCC_DEFINITIONS - Compiler switches required for using libbcc
-#  LIBBPF_LIBRARY_STATIC - libbpf static library (for static compilation)
+#  LIBBCC_BPF_LIBRARY_STATIC - libbpf static library (for static compilation)
 #  LIBBCC_LOADER_LIBRARY_STATIC - libbcc helper static library (for static compilation)
+#  LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE
+#  LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
 #
 # Note that the shared libbcc binary has libbpf and bcc_loader already compiled in but
 # the static doesn't. So when creating a static build those have to be included too.
@@ -19,36 +21,19 @@ find_path (LIBBCC_INCLUDE_DIRS
   NAMES
     bcc/libbpf.h
   PATHS
-    /usr/include
-    /usr/include/bcc
-    /usr/local/include
-    /usr/local/include/libbcc
-    /usr/local/include/bcc
-    /opt/local/include
-    /opt/local/include/libbcc
-    /sw/include
-    /sw/include/libbcc
     ENV CPATH)
 
 find_library (LIBBCC_LIBRARIES
   NAMES
     bcc
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
-find_library (LIBBPF_LIBRARY_STATIC
+find_library (LIBBCC_BPF_LIBRARY_STATIC
   NAMES
-    bpf
+    bcc_bpf
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
@@ -56,10 +41,6 @@ find_library (LIBBCC_LOADER_LIBRARY_STATIC
   NAMES
     bcc-loader-static
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
@@ -70,3 +51,39 @@ include (FindPackageHandleStandardArgs)
 FIND_PACKAGE_HANDLE_STANDARD_ARGS(LibBcc "Please install the bcc library package, which is required. Depending on your distro, it may be called bpfcclib or bcclib (Ubuntu), bcc-devel (Fedora), or something else. If unavailable, install bcc from source (github.com/iovisor/bcc)."
   LIBBCC_LIBRARIES
   LIBBCC_INCLUDE_DIRS)
+
+# Check bpf_attach_kprobe signature
+if(${LIBBCC_FOUND})
+if(STATIC_LINKING)
+  # libbcc.a is not statically linked with libbpf.a, libelf.a, and libz.a.
+  # If we do a static bpftrace build, we must link them in.
+  find_package(LibBpf)
+  find_package(LibElf)
+  find_package(LibZ)
+  SET(CMAKE_REQUIRED_LIBRARIES ${LIBBCC_BPF_LIBRARY_STATIC} ${LIBBPF_LIBRARIES} ${LIBELF_LIBRARIES} ${LIBZ_LIBRARIES})
+else()
+  SET(CMAKE_REQUIRED_LIBRARIES ${LIBBCC_LIBRARIES} ${LIBBPF_LIBRARIES})
+endif()
+
+INCLUDE(CheckCXXSourceCompiles)
+SET(CMAKE_REQUIRED_INCLUDES ${LIBBCC_INCLUDE_DIRS})
+CHECK_CXX_SOURCE_COMPILES("
+#include <bcc/libbpf.h>
+
+int main(void) {
+  bpf_attach_kprobe(0, BPF_PROBE_ENTRY, \"\", \"\", 0, 0);
+  return 0;
+}
+" LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE)
+
+CHECK_CXX_SOURCE_COMPILES("
+#include <bcc/libbpf.h>
+
+int main(void) {
+  bpf_attach_uprobe(0, BPF_PROBE_ENTRY, \"\", \"\", 0, 0, 0);
+  return 0;
+}
+" LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE)
+SET(CMAKE_REQUIRED_LIBRARIES)
+SET(CMAKE_REQUIRED_INCLUDES)
+endif()

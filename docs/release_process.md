@@ -32,18 +32,21 @@ See https://semver.org/ .
 
 ## Tagging a release
 
-You must do 3 things to formally release a version:
+You must do these things to formally release a version:
 
-1. Update `CHANGELOG.md`. Use the following git command to generate the appropriate
-   data format:
-   ```
-   git log --oneline ${PREVIOUS_VER}..upstream/master --no-merges --format=" - %s (%h) by %aN &lt;%aE&gt;"
-   ```
-   where `${PREVIOUS_VER}` is the last release tag, eg `v0.9.3`. Please see previous
-   releases for the final formatting.
+1. Mark the release in the CHANGELOG by replacing the `## Unreleased` header
+   with `## [VERSION] date`.
 1. Update `bpftrace_VERSION_MAJOR`, `bpftrace_VERSION_MINOR`, and
    `bpftrace_VERSION_PATCH` in `CMakeLists.txt` to the target version.
 1. Tag a release. We do this in the github UI by clicking "releases" (on same line
    as "commits"), then "Draft a new release". The tag version and release title
    should be the same and in `vX.Y.Z` format. The tag description should
    be the same as what you added to `CHANGELOG.md`.
+1. Once the release tag pipeline has finished, extract the bpftrace binary from
+   the release build on and attach it to the release.
+  -  `docker run -v
+$(pwd):/output quay.io/iovisor/bpftrace:vXX.YY.ZZ /bin/bash -c "cp
+/usr/bin/bpftrace /output"`
+1. Run `scripts/create-assets.sh` from bpftrace root dir and attach the
+   generated archives to the release.
+

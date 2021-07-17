@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <sstream>
 
 #include "gtest/gtest.h"
@@ -10,24 +11,36 @@ namespace parser {
 
 using Printer = ast::Printer;
 
-void test_parse_failure(const std::string &input)
+void test_parse_failure(BPFtrace &bpftrace, const std::string &input)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
   Driver driver(bpftrace, out);
   ASSERT_EQ(driver.parse_str(input), 1);
 }
 
-void test(const std::string &input, const std::string &output)
+void test_parse_failure(const std::string &input)
 {
   BPFtrace bpftrace;
+  test_parse_failure(bpftrace, input);
+}
+
+void test(BPFtrace &bpftrace,
+          const std::string &input,
+          const std::string &output)
+{
   Driver driver(bpftrace);
   ASSERT_EQ(driver.parse_str(input), 0);
 
   std::ostringstream out;
   Printer printer(out);
-  driver.root_->accept(printer);
+  printer.print(driver.root_);
   EXPECT_EQ(output, out.str());
+}
+
+void test(const std::string &input, const std::string &output)
+{
+  BPFtrace bpftrace;
+  test(bpftrace, input, output);
 }
 
 TEST(Parser, builtin_variables)
@@ -58,11 +71,89 @@ TEST(Parser, builtin_variables)
 TEST(Parser, positional_param)
 {
   test("kprobe:f { $1 }", "Program\n kprobe:f\n  param: $1\n");
+  test_parse_failure("kprobe:f { $0 }");
 }
 
 TEST(Parser, positional_param_count)
 {
   test("kprobe:f { $# }", "Program\n kprobe:f\n  param: $#\n");
+}
+
+TEST(Parser, positional_param_attachpoint)
+{
+  BPFtrace bpftrace;
+  bpftrace.add_param("foo");
+  bpftrace.add_param("bar");
+  bpftrace.add_param("baz");
+
+  test(bpftrace,
+       "kprobe:$1 { 1 }",
+       R"PROG(Program
+ kprobe:foo
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(kprobe:$1"here" { 1 })PROG",
+       R"PROG(Program
+ kprobe:foohere
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:zzzzzzz:$2 { 1 })PROG",
+       R"PROG(Program
+ uprobe:zzzzzzz:bar
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:$1:$2 { 1 })PROG",
+       R"PROG(Program
+ uprobe:foo:bar
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:$2:$1 { 1 })PROG",
+       R"PROG(Program
+ uprobe:bar:foo
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:"zz"$2"zz":"aa"$1 { 1 })PROG",
+       R"PROG(Program
+ uprobe:zzbarzz:aafoo
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:$2:"aa"$1"aa" { 1 })PROG",
+       R"PROG(Program
+ uprobe:bar:aafooaa
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:"$1":$2 { 1 })PROG",
+       R"PROG(Program
+ uprobe:$1:bar
+  int: 1
+)PROG");
+
+  test(bpftrace,
+       R"PROG(uprobe:aa$1:$2 { 1 })PROG",
+       R"PROG(Program
+ uprobe:aafoo:bar
+  int: 1
+)PROG");
+
+  test_parse_failure(bpftrace, R"PROG(uprobe:$1a" { 1 })PROG");
+  test_parse_failure(bpftrace, R"PROG(uprobe:$a" { 1 })PROG");
+  test_parse_failure(bpftrace, R"PROG(uprobe:$-1" { 1 })PROG");
+  test_parse_failure(bpftrace,
+                     R"PROG(uprobe:$999999999999999999999999" { 1 })PROG");
 }
 
 TEST(Parser, comment)
@@ -159,6 +250,20 @@ TEST(Parser, variable_assign)
       "  =\n"
       "   variable: $x\n"
       "   int: -1\n");
+
+  char in_cstr[128];
+  char out_cstr[128];
+
+  snprintf(in_cstr, sizeof(in_cstr), "kprobe:sys_open { $x = %ld; }", LONG_MIN);
+  snprintf(out_cstr,
+           sizeof(out_cstr),
+           "Program\n"
+           " kprobe:sys_open\n"
+           "  =\n"
+           "   variable: $x\n"
+           "   int: %ld\n",
+           LONG_MIN);
+  test(std::string(in_cstr), std::string(out_cstr));
 }
 
 TEST(semantic_analyser, compound_variable_assignments)
@@ -741,21 +846,24 @@ TEST(Parser, if_elseif_elseif_else)
 
 TEST(Parser, unroll)
 {
-  test("kprobe:sys_open { $i = 0; unroll(5) { printf(\"i: %d\\n\", $i); $i = $i + 1; } }",
+  test("kprobe:sys_open { $i = 0; unroll(5) { printf(\"i: %d\\n\", $i); $i = "
+       "$i + 1; } }",
        "Program\n"
        " kprobe:sys_open\n"
        "  =\n"
        "   variable: $i\n"
        "   int: 0\n"
-       "  unroll 5\n"
-       "   call: printf\n"
-       "    string: i: %d\\n\n"
-       "    variable: $i\n"
-       "   =\n"
-       "    variable: $i\n"
-       "    +\n"
+       "  unroll\n"
+       "   int: 5\n"
+       "   block\n"
+       "    call: printf\n"
+       "     string: i: %d\\n\n"
        "     variable: $i\n"
-       "     int: 1\n");
+       "    =\n"
+       "     variable: $i\n"
+       "     +\n"
+       "      variable: $i\n"
+       "      int: 1\n");
 }
 
 TEST(Parser, ternary_str)
@@ -957,6 +1065,10 @@ TEST(Parser, tracepoint_probe)
       "Program\n"
       " tracepoint:sched:sched_switch\n"
       "  int: 1\n");
+  test("tracepoint:* { 1 }",
+       "Program\n"
+       " tracepoint:*:*\n"
+       "  int: 1\n");
 
   test_parse_failure("tracepoint:f { 1 }");
   test_parse_failure("tracepoint { 1 }");
@@ -982,6 +1094,16 @@ TEST(Parser, interval_probe)
       " interval:s:1\n"
       "  int: 1\n");
 
+  test("interval:s:1e3 { 1 }",
+       "Program\n"
+       " interval:s:1000\n"
+       "  int: 1\n");
+
+  test("interval:s:1_0_0_0 { 1 }",
+       "Program\n"
+       " interval:s:1000\n"
+       "  int: 1\n");
+
   test_parse_failure("interval:s:1b { 1 }");
 }
 
@@ -991,6 +1113,16 @@ TEST(Parser, software_probe)
       "Program\n"
       " software:faults:1000\n"
       "  int: 1\n");
+
+  test("software:faults:1e3 { 1 }",
+       "Program\n"
+       " software:faults:1000\n"
+       "  int: 1\n");
+
+  test("software:faults:1_000 { 1 }",
+       "Program\n"
+       " software:faults:1000\n"
+       "  int: 1\n");
 
   test_parse_failure("software:faults:1b { 1 }");
 }
@@ -1002,19 +1134,45 @@ TEST(Parser, hardware_probe)
       " hardware:cache-references:1000000\n"
       "  int: 1\n");
 
+  test("hardware:cache-references:1e6 { 1 }",
+       "Program\n"
+       " hardware:cache-references:1000000\n"
+       "  int: 1\n");
+
+  test("hardware:cache-references:1_000_000 { 1 }",
+       "Program\n"
+       " hardware:cache-references:1000000\n"
+       "  int: 1\n");
+
   test_parse_failure("hardware:cache-references:1b { 1 }");
 }
 
 TEST(Parser, watchpoint_probe)
 {
-  test("watchpoint::1234:8:w { 1 }",
+  test("watchpoint:1234:8:w { 1 }",
        "Program\n"
        " watchpoint:1234:8:w\n"
        "  int: 1\n");
 
-  test_parse_failure("watchpoint::1b:8:w { 1 }");
-  test_parse_failure("watchpoint::1:8a:w { 1 }");
-  test_parse_failure("watchpoint::1b:8a:w { 1 }");
+  test_parse_failure("watchpoint:1b:8:w { 1 }");
+  test_parse_failure("watchpoint:1:8a:w { 1 }");
+  test_parse_failure("watchpoint:1b:8a:w { 1 }");
+  test_parse_failure("watchpoint:+arg0:8:rw { 1 }");
+  test_parse_failure("watchpoint:func1:8:rw { 1 }");
+}
+
+TEST(Parser, asyncwatchpoint_probe)
+{
+  test("asyncwatchpoint:1234:8:w { 1 }",
+       "Program\n"
+       " asyncwatchpoint:1234:8:w\n"
+       "  int: 1\n");
+
+  test_parse_failure("asyncwatchpoint:1b:8:w { 1 }");
+  test_parse_failure("asyncwatchpoint:1:8a:w { 1 }");
+  test_parse_failure("asyncwatchpoint:1b:8a:w { 1 }");
+  test_parse_failure("asyncwatchpoint:+arg0:8:rw { 1 }");
+  test_parse_failure("asyncwatchpoint:func1:8:rw { 1 }");
 }
 
 TEST(Parser, multiple_attach_points_kprobe)
@@ -1034,6 +1192,24 @@ TEST(Parser, character_class_attach_point)
       "Program\n"
       " kprobe:[Ss]y[Ss]_read\n"
       "  int: 1\n");
+}
+
+TEST(Parser, wildcard_probetype)
+{
+  test("t*point:sched:sched_switch { 1; }",
+       "Program\n"
+       " tracepoint:sched:sched_switch\n"
+       "  int: 1\n");
+  test("*ware:* { 1; }",
+       "Program\n"
+       " hardware:*\n"
+       " software:*\n"
+       "  int: 1\n");
+  test("*:/bin/sh:* { 1; }",
+       "Program\n"
+       " uprobe:/bin/sh:*\n"
+       " usdt:/bin/sh:*\n"
+       "  int: 1\n");
 }
 
 TEST(Parser, wildcard_attach_points)
@@ -1543,6 +1719,30 @@ TEST(Parser, empty_arguments)
   test_parse_failure(":w:0x10000000:8:rw { 1 }");
 }
 
+TEST(Parser, int_notation)
+{
+  test("k:f { print(1e6); }",
+       "Program\n kprobe:f\n  call: print\n   int: 1000000\n");
+  test("k:f { print(5e9); }",
+       "Program\n kprobe:f\n  call: print\n   int: 5000000000\n");
+  test("k:f { print(1e1_0); }",
+       "Program\n kprobe:f\n  call: print\n   int: 10000000000\n");
+  test("k:f { print(1_000_000_000_0); }",
+       "Program\n kprobe:f\n  call: print\n   int: 10000000000\n");
+  test("k:f { print(1_0_0_0_00_0_000_0); }",
+       "Program\n kprobe:f\n  call: print\n   int: 10000000000\n");
+  test("k:f { print(123_456_789_0); }",
+       "Program\n kprobe:f\n  call: print\n   int: 1234567890\n");
+
+  test_parse_failure("k:f { print(5e-9); }");
+  test_parse_failure("k:f { print(1e17); }");
+  test_parse_failure("k:f { print(12e4); }");
+  test_parse_failure("k:f { print(1_1e100); }");
+  test_parse_failure("k:f { print(1e1_1_); }");
+  test_parse_failure("k:f { print(1_1_e100); }");
+  test_parse_failure("k:f { print(1_1_); }");
+}
+
 TEST(Parser, while_loop)
 {
   test("i:ms:100 { $a = 0; while($a < 10) { $a++ }}",
@@ -1559,6 +1759,45 @@ TEST(Parser, while_loop)
     variable: $a
      ++
 )PROG");
+}
+
+TEST(Parser, tuple_assignment_error_message)
+{
+  BPFtrace bpftrace;
+  std::stringstream out;
+  Driver driver(bpftrace, out);
+  EXPECT_EQ(driver.parse_str("i:s:1 { @x = (1, 2); $x.1 = 1; }"), 1);
+  std::string expected =
+      R"(stdin:1:22-30: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
+i:s:1 { @x = (1, 2); $x.1 = 1; }
+                     ~~~~~~~~
+)";
+  EXPECT_EQ(out.str(), expected);
+}
+
+TEST(Parser, tuple_assignment_error)
+{
+  test_parse_failure("i:s:1 { (1, 0) = 0 }");
+  test_parse_failure("i:s:1 { ((1, 0), 3).0.0 = 3 }");
+  test_parse_failure("i:s:1 { ((1, 0), 3).0 = (0, 1) }");
+  test_parse_failure("i:s:1 { (1, \"two\", (3, 4)).5 = \"six\"; }");
+  test_parse_failure("i:s:1 { $a = 1; $a.2 = 3 }");
+  test_parse_failure("i:s:1 { 0.1 = 1.0 }");
+}
+
+TEST(Parser, abs_knl_address)
+{
+  char in_cstr[64];
+  char out_cstr[64];
+
+  snprintf(in_cstr, sizeof(in_cstr), "watchpoint:0x%lx:4:w { 1; }", ULONG_MAX);
+  snprintf(out_cstr,
+           sizeof(out_cstr),
+           "Program\n"
+           " watchpoint:%lu:4:w\n"
+           "  int: 1\n",
+           ULONG_MAX);
+  test(std::string(in_cstr), std::string(out_cstr));
 }
 
 } // namespace parser

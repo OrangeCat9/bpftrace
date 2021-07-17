@@ -25,20 +25,14 @@ compares it (string compare) with the expected result, a file named by the
 second argument. The `NAME` macro holds the test name,  which is `call_avg` in
 this case.
 
-As the differences between LLVM versions are usually quite small (function
-signatures) we have a rewriter which takes care of most of the differences (the
-details can be found in `common.h`). It rewrites the expected IR from LLVM-8
-format into the format of the currently used LLVM version.
-However as not everything can be rewritten loading a LLVM version specific
-result file is also supported. These have a `_LLVM-${VERSION}` suffix (e.g.
-`call_str_LLVM-5.ll`).
-If a version specific file exisits the `test` function will use it
-automatically, else it will fall back to rewriting.
-
 #### Updating
 
-If the test is run with `BPFTRACE_UPDATE_TESTS=1` the `test` helper will update
-the IR instead of running the tests.
+Run `./scripts/update_codegen_tests.sh` after making codegen changes up update
+the expected LLVM IR.
+
+Alternatively (if you need more control over which tests are updated), if the
+test is run with `BPFTRACE_UPDATE_TESTS=1` the `test` helper will update the IR
+instead of running the tests.
 
 ## Runtime tests
 

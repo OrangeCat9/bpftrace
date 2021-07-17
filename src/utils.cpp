@@ -1,21 +1,42 @@
-#include <cstring>
-
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <glob.h>
+#include <limits>
+#include <link.h>
 #include <map>
 #include <memory>
+#include <regex>
 #include <sstream>
 #include <string>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <tuple>
 #include <unistd.h>
 
+#include "bpftrace.h"
+#include "log.h"
+#include "probe_matcher.h"
 #include "utils.h"
 #include <bcc/bcc_elf.h>
+#include <bcc/bcc_syms.h>
 #include <bcc/bcc_usdt.h>
+#include <elf.h>
+
+#include <linux/version.h>
+
+#if __has_include(<filesystem>)
+#include <filesystem>
+namespace std_filesystem = std::filesystem;
+#elif __has_include(<experimental/filesystem>)
+#include <experimental/filesystem>
+namespace std_filesystem = std::experimental::filesystem;
+#else
+#error "neither <filesystem> nor <experimental/filesystem> are present"
+#endif
 
 namespace {
 
@@ -88,19 +109,9 @@ const struct vmlinux_location vmlinux_locs[] = {
   { nullptr, false },
 };
 
-static bool provider_cache_loaded = false;
-
-// Maps all providers of pid to vector of tracepoints on that provider
-static std::map<std::string, usdt_probe_list> usdt_provider_cache;
-
 static bool pid_in_different_mountns(int pid);
 static std::vector<std::string>
 resolve_binary_path(const std::string &cmd, const char *env_paths, int pid);
-
-static void usdt_probe_each(struct bcc_usdt *usdt_probe)
-{
-  usdt_provider_cache[usdt_probe->provider].push_back(std::make_tuple(usdt_probe->bin_path, usdt_probe->provider, usdt_probe->name));
-}
 
 void StdioSilencer::silence()
 {
@@ -124,104 +135,6 @@ StdioSilencer::~StdioSilencer()
   }
 }
 
-usdt_probe_entry USDTHelper::find(
-    int pid,
-    const std::string &target,
-    const std::string &provider,
-    const std::string &name)
-{
-
-  if (pid > 0)
-    read_probes_for_pid(pid);
-  else
-    read_probes_for_path(target);
-
-  usdt_probe_list probes = usdt_provider_cache[provider];
-
-  auto it = std::find_if(probes.begin(), probes.end(), [&name](const usdt_probe_entry& e) {return std::get<USDT_FNAME_INDEX>(e) == name;});
-  if (it != probes.end()) {
-    return *it;
-  } else {
-    return std::make_tuple("", "", "");
-  }
-}
-
-usdt_probe_list USDTHelper::probes_for_provider(const std::string &provider)
-{
-  usdt_probe_list probes;
-
-  if(!provider_cache_loaded) {
-    std::cerr << "cannot read probes by provider before providers have been loaded by pid or path." << std::endl;
-    return probes;
-  }
-
-  read_probes_for_pid(0);
-  return usdt_provider_cache[provider];
-}
-
-usdt_probe_list USDTHelper::probes_for_pid(int pid)
-{
-  read_probes_for_pid(pid);
-
-  usdt_probe_list probes;
-  for (auto const& usdt_probes : usdt_provider_cache)
-  {
-    probes.insert( probes.end(), usdt_probes.second.begin(), usdt_probes.second.end() );
-  }
-  return probes;
-}
-
-usdt_probe_list USDTHelper::probes_for_path(const std::string &path)
-{
-  read_probes_for_path(path);
-
-  usdt_probe_list probes;
-  for (auto const& usdt_probes : usdt_provider_cache)
-  {
-    probes.insert( probes.end(), usdt_probes.second.begin(), usdt_probes.second.end() );
-  }
-  return probes;
-}
-
-void USDTHelper::read_probes_for_pid(int pid)
-{
-  if(provider_cache_loaded)
-    return;
-
-  if (pid > 0) {
-    void *ctx = bcc_usdt_new_frompid(pid, nullptr);
-    if (ctx == nullptr) {
-      std::cerr << "failed to initialize usdt context for pid: " << pid << std::endl;
-      if (kill(pid, 0) == -1 && errno == ESRCH) {
-        std::cerr << "hint: process not running" << std::endl;
-      }
-      return;
-    }
-    bcc_usdt_foreach(ctx, usdt_probe_each);
-    bcc_usdt_close(ctx);
-
-    provider_cache_loaded = true;
-  } else {
-    std::cerr << "a pid must be specified to list USDT probes by PID" << std::endl;
-  }
-}
-
-void USDTHelper::read_probes_for_path(const std::string &path)
-{
-  if(provider_cache_loaded)
-    return;
-
-  void *ctx = bcc_usdt_new_frompath(path.c_str());
-  if (ctx == nullptr) {
-    std::cerr << "failed to initialize usdt context for path " << path << std::endl;
-    return;
-  }
-  bcc_usdt_foreach(ctx, usdt_probe_each);
-  bcc_usdt_close(ctx);
-
-  provider_cache_loaded = true;
-}
-
 bool get_uint64_env_var(const std::string &str, uint64_t &dest)
 {
   if (const char* env_p = std::getenv(str.c_str()))
@@ -229,28 +142,31 @@ bool get_uint64_env_var(const std::string &str, uint64_t &dest)
     std::istringstream stringstream(env_p);
     if (!(stringstream >> dest))
     {
-      std::cerr << "Env var '" << str << "' did not contain a valid uint64_t, or was zero-valued." << std::endl;
+      LOG(ERROR) << "Env var '" << str
+                 << "' did not contain a valid uint64_t, or was zero-valued.";
       return false;
     }
   }
   return true;
 }
 
+std::string get_pid_exe(const std::string &pid)
+{
+  std::error_code ec;
+  std_filesystem::path proc_path{ "/proc" };
+  proc_path /= pid;
+  proc_path /= "exe";
+
+  if (!std_filesystem::exists(proc_path, ec) ||
+      !std_filesystem::is_symlink(proc_path, ec))
+    return "";
+
+  return std_filesystem::read_symlink(proc_path).string();
+}
+
 std::string get_pid_exe(pid_t pid)
 {
-  char proc_path[512];
-  char exe_path[4096];
-  int res;
-
-  sprintf(proc_path, "/proc/%d/exe", pid);
-  res = readlink(proc_path, exe_path, sizeof(exe_path));
-  if (res == -1)
-    return "";
-  if (res >= static_cast<int>(sizeof(exe_path))) {
-    throw std::runtime_error("executable path exceeded maximum supported size of 4096 characters");
-  }
-  exe_path[res] = '\0';
-  return std::string(exe_path);
+  return get_pid_exe(std::to_string(pid));
 }
 
 bool has_wildcard(const std::string &str)
@@ -274,6 +190,14 @@ std::vector<std::string> split_string(const std::string &str,
     elems.push_back(value);
   }
   return elems;
+}
+
+/// Erase prefix up to the first colon (:) from str and return the prefix
+std::string erase_prefix(std::string &str)
+{
+  std::string prefix = str.substr(0, str.find(':'));
+  str.erase(0, prefix.length() + 1);
+  return prefix;
 }
 
 bool wildcard_match(const std::string &str, std::vector<std::string> &tokens, bool start_wildcard, bool end_wildcard) {
@@ -365,7 +289,7 @@ std::vector<std::string> get_kernel_cflags(
   cflags.push_back("-D__HAVE_BUILTIN_BSWAP16__");
   cflags.push_back("-D__HAVE_BUILTIN_BSWAP32__");
   cflags.push_back("-D__HAVE_BUILTIN_BSWAP64__");
-  cflags.push_back("-DKBUILD_MODNAME='\"bpftrace\"'");
+  cflags.push_back("-DKBUILD_MODNAME=\"bpftrace\"");
 
   // If ARCH env variable is set, pass this along.
   if (archenv)
@@ -376,12 +300,9 @@ std::vector<std::string> get_kernel_cflags(
 
 bool is_dir(const std::string& path)
 {
-  struct stat buf;
-
-  if (::stat(path.c_str(), &buf) < 0)
-    return false;
-
-  return S_ISDIR(buf.st_mode);
+  std::error_code ec;
+  std_filesystem::path buf{ path };
+  return std_filesystem::is_directory(buf, ec);
 }
 
 namespace {
@@ -414,27 +335,33 @@ namespace {
 
   std::string unpack_kheaders_tar_xz(const struct utsname& utsname)
   {
-    std::string path_prefix{"/tmp"};
+    std::error_code ec;
+    std_filesystem::path path_prefix{ "/tmp" };
+    std_filesystem::path path_kheaders{ "/sys/kernel/kheaders.tar.xz" };
     if (const char* tmpdir = ::getenv("TMPDIR")) {
       path_prefix = tmpdir;
     }
-    path_prefix += "/kheaders-";
-    std::string shared_path{path_prefix + utsname.release};
+    path_prefix /= "kheaders-";
+    std_filesystem::path shared_path{ path_prefix.string() + utsname.release };
 
-    struct stat stat_buf;
-
-    if (::stat(shared_path.c_str(), &stat_buf) == 0) {
+    if (std_filesystem::exists(shared_path, ec))
+    {
       // already unpacked
-      return shared_path;
+      return shared_path.string();
     }
 
-    if (::stat("/sys/kernel/kheaders.tar.xz", &stat_buf) != 0) {
+    if (!std_filesystem::exists(path_kheaders, ec))
+    {
+      StderrSilencer silencer;
+      silencer.silence();
+
       FILE* modprobe = ::popen("modprobe kheaders", "w");
       if (modprobe == nullptr || pclose(modprobe) != 0) {
         return "";
       }
 
-      if (::stat("/sys/kernel/kheaders.tar.xz", &stat_buf) != 0) {
+      if (!std_filesystem::exists(path_kheaders, ec))
+      {
         return "";
       }
     }
@@ -472,7 +399,9 @@ namespace {
 //
 // {"", ""} is returned if no trace of kernel headers was found at all.
 // Both ksrc and kobj are guaranteed to be != "", if at least some trace of kernel sources was found.
-std::tuple<std::string, std::string> get_kernel_dirs(const struct utsname& utsname)
+std::tuple<std::string, std::string> get_kernel_dirs(
+    const struct utsname &utsname,
+    bool unpack_kheaders)
 {
 #ifdef KERNEL_HEADERS_DIR
   return {KERNEL_HEADERS_DIR, KERNEL_HEADERS_DIR};
@@ -493,17 +422,22 @@ std::tuple<std::string, std::string> get_kernel_dirs(const struct utsname& utsna
   if (!is_dir(kobj)) {
     kobj = "";
   }
-  if (ksrc == "" && kobj == "") {
-    const auto kheaders_tar_xz_path = unpack_kheaders_tar_xz(utsname);
-    if (kheaders_tar_xz_path.size() > 0) {
-      return std::make_tuple(kheaders_tar_xz_path, kheaders_tar_xz_path);
+  if (ksrc.empty() && kobj.empty())
+  {
+    if (unpack_kheaders)
+    {
+      const auto kheaders_tar_xz_path = unpack_kheaders_tar_xz(utsname);
+      if (kheaders_tar_xz_path.size() > 0)
+        return std::make_tuple(kheaders_tar_xz_path, kheaders_tar_xz_path);
     }
     return std::make_tuple("", "");
   }
-  if (ksrc == "") {
+  if (ksrc.empty())
+  {
     ksrc = kobj;
   }
-  else if (kobj == "") {
+  else if (kobj.empty())
+  {
     kobj = ksrc;
   }
 
@@ -521,8 +455,9 @@ const std::string &is_deprecated(const std::string &str)
     {
       if (item->show_warning)
       {
-        std::cerr << "warning: " << item->old_name << " is deprecated and will be removed in the future. ";
-        std::cerr << "Use " << item->new_name << " instead." << std::endl;
+        LOG(WARNING) << item->old_name
+                     << " is deprecated and will be removed in the future. Use "
+                     << item->new_name << " instead.";
         item->show_warning = false;
       }
 
@@ -675,62 +610,39 @@ namespace, it will throw an exception
 */
 static bool pid_in_different_mountns(int pid)
 {
-
-  struct stat self_stat, target_stat;
-  int self_fd = -1, target_fd = -1;
-  std::stringstream errmsg;
-  char buf[64];
-
   if (pid <= 0)
     return false;
 
-  if ((size_t)snprintf(buf, sizeof(buf), "/proc/%d/ns/mnt", pid) >= sizeof(buf))
+  std::error_code ec;
+  std_filesystem::path self_path{ "/proc/self/ns/mnt" };
+  std_filesystem::path target_path{ "/proc" };
+  target_path /= std::to_string(pid);
+  target_path /= "ns/mnt";
+
+  if (!std_filesystem::exists(self_path, ec))
   {
-    errmsg << "Reading mountNS would overflow buffer.";
-    goto error;
+    throw MountNSException(
+        "Failed to compare mount ns with PID " + std::to_string(pid) +
+        ". The error was open (/proc/self/ns/mnt): " + ec.message());
   }
 
-  self_fd = open("/proc/self/ns/mnt", O_RDONLY);
-  if (self_fd < 0)
+  if (!std_filesystem::exists(target_path, ec))
   {
-    errmsg << "open(/proc/self/ns/mnt): " << strerror(errno);
-    goto error;
+    throw MountNSException(
+        "Failed to compare mount ns with PID " + std::to_string(pid) +
+        ". The error was open (/proc/<pid>/ns/mnt): " + ec.message());
   }
 
-  target_fd = open(buf, O_RDONLY);
-  if (target_fd < 0)
+  bool result = !std_filesystem::equivalent(self_path, target_path, ec);
+
+  if (ec)
   {
-    errmsg << "open(/proc/<pid>/ns/mnt): " << strerror(errno);
-    goto error;
+    throw MountNSException("Failed to compare mount ns with PID " +
+                           std::to_string(pid) +
+                           ". The error was (fstat): " + ec.message());
   }
 
-  if (fstat(self_fd, &self_stat))
-  {
-    errmsg << "fstat(self_fd): " << strerror(errno);
-    goto error;
-  }
-
-  if (fstat(target_fd, &target_stat))
-  {
-    errmsg << "fstat(target_fd)" << strerror(errno);
-    goto error;
-  }
-
-  close(self_fd);
-  close(target_fd);
-  return self_stat.st_ino != target_stat.st_ino;
-
-error:
-  if (self_fd >= 0)
-    close(self_fd);
-  if (target_fd >= 0)
-    close(target_fd);
-
-  throw MountNSException("Failed to compare mount ns with PID " +
-                         std::to_string(pid) + ". " + "The error was " +
-                         errmsg.str());
-
-  return false;
+  return result;
 }
 
 void cat_file(const char *filename, size_t max_bytes, std::ostream &out)
@@ -739,8 +651,8 @@ void cat_file(const char *filename, size_t max_bytes, std::ostream &out)
   const size_t BUFSIZE = 4096;
 
   if (file.fail()){
-    std::cerr << "Error opening file '" << filename << "': ";
-    std::cerr << strerror(errno) << std::endl;
+    LOG(ERROR) << "failed to open file '" << filename
+               << "': " << strerror(errno);
     return;
   }
 
@@ -756,8 +668,8 @@ void cat_file(const char *filename, size_t max_bytes, std::ostream &out)
       return;
     }
     if (file.fail()) {
-      std::cerr << "Error opening file '" << filename << "': ";
-      std::cerr << strerror(errno) << std::endl;
+      LOG(ERROR) << "failed to open file '" << filename
+                 << "': " << strerror(errno);
       return;
     }
     bytes_read += file.gcount();
@@ -843,6 +755,228 @@ std::string hex_format_buffer(const char *buf, size_t size)
   s[offset] = '\0';
 
   return std::string(s);
+}
+
+std::unordered_set<std::string> get_traceable_funcs()
+{
+#ifdef FUZZ
+  return {};
+#else
+  // Try to get the list of functions from BPFTRACE_AVAILABLE_FUNCTIONS_TEST env
+  const char *path = std::getenv("BPFTRACE_AVAILABLE_FUNCTIONS_TEST");
+
+  // Use kprobe list as default
+  if (!path)
+    path = kprobe_path.c_str();
+
+  std::ifstream available_funs(path);
+  if (available_funs.fail())
+  {
+    if (bt_debug != DebugLevel::kNone)
+    {
+      std::cerr << "Error while reading traceable functions from "
+                << kprobe_path << ": " << strerror(errno);
+    }
+    return {};
+  }
+
+  std::unordered_set<std::string> result;
+  std::string line;
+  while (std::getline(available_funs, line))
+  {
+    if (symbol_has_module(line))
+      result.insert(strip_symbol_module(line));
+    else
+      result.insert(line);
+  }
+  return result;
+#endif
+}
+
+/**
+ * Search for LINUX_VERSION_CODE in the vDSO, returning 0 if it can't be found.
+ */
+static uint32_t _find_version_note(unsigned long base)
+{
+  auto ehdr = reinterpret_cast<const ElfW(Ehdr) *>(base);
+
+  for (int i = 0; i < ehdr->e_shnum; i++)
+  {
+    auto shdr = reinterpret_cast<const ElfW(Shdr) *>(base + ehdr->e_shoff +
+                                                     (i * ehdr->e_shentsize));
+
+    if (shdr->sh_type == SHT_NOTE)
+    {
+      auto ptr = reinterpret_cast<const char *>(base + shdr->sh_offset);
+      auto end = ptr + shdr->sh_size;
+
+      while (ptr < end)
+      {
+        auto nhdr = reinterpret_cast<const ElfW(Nhdr) *>(ptr);
+        ptr += sizeof *nhdr;
+
+        auto name = ptr;
+        ptr += (nhdr->n_namesz + sizeof(ElfW(Word)) - 1) & -sizeof(ElfW(Word));
+
+        auto desc = ptr;
+        ptr += (nhdr->n_descsz + sizeof(ElfW(Word)) - 1) & -sizeof(ElfW(Word));
+
+        if ((nhdr->n_namesz > 5 && !memcmp(name, "Linux", 5)) &&
+            nhdr->n_descsz == 4 && !nhdr->n_type)
+          return *reinterpret_cast<const uint32_t *>(desc);
+      }
+    }
+  }
+
+  return 0;
+}
+
+static uint32_t kernel_version_from_vdso(void)
+{
+  // Fetch LINUX_VERSION_CODE from the vDSO .note section, falling back on
+  // the build-time constant if unavailable. This always matches the
+  // running kernel, but is not supported on arm32.
+  unsigned code = 0;
+  unsigned long base = getauxval(AT_SYSINFO_EHDR);
+  if (base && !memcmp(reinterpret_cast<void *>(base), ELFMAG, 4))
+    code = _find_version_note(base);
+  if (!code)
+    code = LINUX_VERSION_CODE;
+  return code;
+}
+
+static uint32_t kernel_version_from_uts(void)
+{
+  struct utsname utsname;
+  if (uname(&utsname) < 0)
+    return 0;
+  unsigned x, y, z;
+  if (sscanf(utsname.release, "%u.%u.%u", &x, &y, &z) != 3)
+    return 0;
+  return KERNEL_VERSION(x, y, z);
+}
+
+static uint32_t kernel_version_from_khdr(void)
+{
+  // Try to get the definition of LINUX_VERSION_CODE at runtime.
+  std::ifstream linux_version_header{ "/usr/include/linux/version.h" };
+  const std::string content{ std::istreambuf_iterator<char>(
+                                 linux_version_header),
+                             std::istreambuf_iterator<char>() };
+  const std::regex regex{ "#define\\s+LINUX_VERSION_CODE\\s+(\\d+)" };
+  std::smatch match;
+
+  if (std::regex_search(content.begin(), content.end(), match, regex))
+    return static_cast<unsigned>(std::stoi(match[1]));
+
+  return 0;
+}
+
+/**
+ * Find a LINUX_VERSION_CODE matching the host kernel. The build-time constant
+ * may not match if bpftrace is compiled on a different Linux version than it's
+ * used on, e.g. if built with Docker.
+ */
+uint32_t kernel_version(int attempt)
+{
+  static std::optional<uint32_t> a0, a1, a2;
+  switch (attempt)
+  {
+    case 0:
+    {
+      if (!a0)
+        a0 = kernel_version_from_vdso();
+      return *a0;
+    }
+    case 1:
+    {
+      if (!a1)
+        a1 = kernel_version_from_uts();
+      return *a1;
+    }
+    case 2:
+    {
+      if (!a2)
+        a2 = kernel_version_from_khdr();
+      return *a2;
+    }
+    default:
+      throw std::runtime_error("BUG: kernel_version(): Invalid attempt: " +
+                               std::to_string(attempt));
+  }
+}
+
+std::optional<std::string> abs_path(const std::string &rel_path)
+{
+  // filesystem::canonical does not work very well with /proc/<pid>/root paths
+  // of processes in a different mount namespace (than the one bpftrace is
+  // running in), failing during canonicalization. See iovisor:bpftrace#1595
+  static auto re = std::regex("^/proc/\\d+/root/.*");
+  if (!std::regex_match(rel_path, re))
+  {
+    try
+    {
+      auto p = std_filesystem::path(rel_path);
+      return std_filesystem::canonical(std_filesystem::absolute(p)).string();
+    }
+    catch (std_filesystem::filesystem_error &)
+    {
+      return {};
+    }
+  }
+  else
+  {
+    return rel_path;
+  }
+}
+
+int64_t min_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  int64_t val, max = 0, retval;
+  for (int i = 0; i < nvalues; i++)
+  {
+    val = read_data<int64_t>(value.data() + i * sizeof(int64_t));
+    if (val > max)
+      max = val;
+  }
+
+  /*
+   * This is a hack really until the code generation for the min() function
+   * is sorted out. The way it is currently implemented doesn't allow >
+   * 32 bit quantities and also means we have to do gymnastics with the return
+   * value owing to the way it is stored (i.e., 0xffffffff - val).
+   */
+  if (max == 0) /* If we have applied the zero() function */
+    retval = max;
+  else if ((0xffffffff - max) <= 0) /* A negative 32 bit value */
+    retval = 0 - (max - 0xffffffff);
+  else
+    retval = 0xffffffff - max; /* A positive 32 bit value */
+
+  return retval;
+}
+
+uint64_t max_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  uint64_t val, max = 0;
+  for (int i = 0; i < nvalues; i++)
+  {
+    val = read_data<uint64_t>(value.data() + i * sizeof(uint64_t));
+    if (val > max)
+      max = val;
+  }
+  return max;
+}
+
+bool symbol_has_module(const std::string &symbol)
+{
+  return !symbol.empty() && symbol[symbol.size() - 1] == ']';
+}
+
+std::string strip_symbol_module(const std::string &symbol)
+{
+  size_t idx = symbol.rfind(" [");
+  return idx != std::string::npos ? symbol.substr(0, idx) : symbol;
 }
 
 } // namespace bpftrace

@@ -1,7 +1,7 @@
 # bpftrace
 
 [![Build Status](https://github.com/iovisor/bpftrace/workflows/CI/badge.svg?branch=master)](https://github.com/iovisor/bpftrace/actions?query=workflow%3ACI+branch%3Amaster)
-[![IRC #bpftrace](https://img.shields.io/badge/IRC-bpftrace-blue.svg)](http://irc.lc/oftc/bpftrace/web@@@)
+[![IRC#bpftrace](https://img.shields.io/badge/IRC-bpftrace-blue.svg)](https://webchat.oftc.net/?channels=bpftrace)
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/iovisor/bpftrace.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/iovisor/bpftrace/alerts/)
 
 bpftrace is a high-level tracing language for Linux enhanced Berkeley Packet Filter (eBPF) available in recent Linux kernels (4.x). bpftrace uses LLVM as a backend to compile scripts to BPF-bytecode and makes use of [BCC](https://github.com/iovisor/bcc) for interacting with the Linux BPF system, as well as existing Linux tracing capabilities: kernel dynamic tracing (kprobes), user-level dynamic tracing (uprobes), and tracepoints. The bpftrace language is inspired by awk and C, and predecessor tracers such as DTrace and SystemTap. bpftrace was created by [Alastair Robertson](https://github.com/ajor).
@@ -97,6 +97,10 @@ For more eBPF observability tools, see [bcc tools](https://github.com/iovisor/bc
 
 See the [Reference Guide](docs/reference_guide.md) for more detail.
 
+## Support
+
+For additional help / discussion, please use our [discussions](https://github.com/iovisor/bpftrace/discussions) page.
+
 ## Contributing
 
 * Have ideas for new bpftrace tools? [CONTRIBUTING-TOOLS.md](CONTRIBUTING-TOOLS.md)
@@ -110,10 +114,18 @@ See the [Reference Guide](docs/reference_guide.md) for more detail.
 For development and testing a [Vagrantfile](Vagrantfile) is available.
 
 Make sure you have the `vbguest` plugin installed, it is required to correctly
-install the shared file system driver on the ubuntu boxes.
+install the shared file system driver on the ubuntu boxes:
 
 ```
 $ vagrant plugin install vagrant-vbguest
+```
+
+Start VM:
+
+```
+$ vagrant status
+$ vagrant up $YOUR_CHOICE
+$ vagrant ssh $YOUR_CHOICE
 ```
 
 ## License

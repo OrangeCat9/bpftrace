@@ -31,6 +31,23 @@ struct Print
   }
 } __attribute__((packed));
 
+struct PrintNonMap
+{
+  uint64_t action_id;
+  uint64_t print_id;
+  // See below why we don't use a flexible length array
+  uint8_t content[0];
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b, size_t size)
+  {
+    return {
+      b.getInt64Ty(),                            // asyncid
+      b.getInt64Ty(),                            // print id
+      llvm::ArrayType::get(b.getInt8Ty(), size), // content
+    };
+  }
+} __attribute__((packed));
+
 struct MapEvent
 {
   uint64_t action_id;
@@ -59,6 +76,20 @@ struct Time
   }
 } __attribute__((packed));
 
+struct Strftime
+{
+  uint64_t strftime_id;
+  uint64_t nsecs_since_boot;
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b)
+  {
+    return {
+      b.getInt64Ty(), // strftime id
+      b.getInt64Ty(), // strftime arg, time elapsed since boot
+    };
+  }
+} __attribute__((packed));
+
 struct Buf
 {
   uint8_t length;
@@ -73,6 +104,52 @@ struct Buf
     return {
       b.getInt8Ty(),                               // buffer length
       llvm::ArrayType::get(b.getInt8Ty(), length), // buffer content
+    };
+  }
+} __attribute__((packed));
+
+struct HelperError
+{
+  uint64_t action_id;
+  uint64_t error_id;
+  int32_t return_value;
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b)
+  {
+    return {
+      b.getInt64Ty(), // asyncid
+      b.getInt64Ty(), // error_id
+      b.getInt32Ty(), // return value
+    };
+  }
+} __attribute__((packed));
+
+struct Watchpoint
+{
+  uint64_t action_id;
+  uint64_t watchpoint_idx;
+  uint64_t addr;
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b)
+  {
+    return {
+      b.getInt64Ty(), // asyncid
+      b.getInt64Ty(), // watchpoint_idx
+      b.getInt64Ty(), // addr
+    };
+  }
+} __attribute__((packed));
+
+struct WatchpointUnwatch
+{
+  uint64_t action_id;
+  uint64_t addr;
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b)
+  {
+    return {
+      b.getInt64Ty(), // asyncid
+      b.getInt64Ty(), // addr
     };
   }
 } __attribute__((packed));
